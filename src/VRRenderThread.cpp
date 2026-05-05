@@ -664,25 +664,6 @@ void VRRenderThread::runVRMode()
     interactor->SetActionManifestDirectory(bindingsDir.toStdString());
     interactor->SetActionManifestFileName(manifestPath.toStdString());
 
-    auto triggerSelect = [this, rendererPtr = renderer.Get()](vtkEventData* eventData) {
-        vtkEventDataDevice3D* event3D =
-            eventData ? eventData->GetAsEventDataDevice3D() : nullptr;
-        if (!event3D) return;
-
-        vtkEventDataAction action = event3D->GetAction();
-        if (action == vtkEventDataAction::Release ||
-            action == vtkEventDataAction::Untouch) {
-            this->onVRTriggerRelease();
-        } else {
-            this->onVRTriggerPress(event3D, rendererPtr);
-        }
-    };
-
-    /* 直接把绑定文件中的TriggerAction接到选择逻辑,避免默认VTK交互样式吞掉事件。
-     * Wire TriggerAction directly to selection so the default VTK style cannot consume it. */
-    interactor->AddAction("/actions/vtk/in/TriggerAction", false, triggerSelect);
-    interactor->AddAction("/actions/vtk/in/triggeraction", false, triggerSelect);
-
     /* 初始化顺序:先renderWindow建立OpenVR会话,再interactor注册动作集
      * Init order: renderWindow first (establishes OpenVR session), interactor second (registers action set) */
     renderWindow->Initialize();
