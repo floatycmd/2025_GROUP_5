@@ -593,11 +593,17 @@ private:
     /* ---- VR控制器拾取状态(由3D事件回调使用)----
      *      VR controller picking state (used by 3D event callbacks) ---- */
     vtkOpenVRRenderer*              vrPickRenderer; /**< 场景启动时设置,供回调使用。
-                                                     * Set at scene startup for callbacks. */
+                                                      * Set at scene startup for callbacks. */
     vtkSmartPointer<vtkPicker>      vrPicker;       /**< 三维射线拾取器。
-                                                     * 3-D ray picker. */
+                                                      * 3-D ray picker. */
+    bool                            hasVRControllerPose; /**< 是否已有手柄射线姿态。
+                                                          * Whether a controller ray pose has been cached. */
+    double                          vrLastControllerPos[3]; /**< 上一帧控制器位置。
+                                                             * Controller position last frame. */
+    double                          vrLastControllerDir[3]; /**< 上一帧控制器射线方向。
+                                                             * Controller ray direction last frame. */
     double                          vrDragLastPos[3]; /**< 上一帧控制器位置。
-                                                       * Controller position last frame. */
+                                                        * Controller position last frame. */
 };
 
 #endif /* 结束 VRRENDERTHREAD_H 包含保护

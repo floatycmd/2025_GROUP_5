@@ -168,6 +168,7 @@ MainWindow::MainWindow(QWidget* parent)
     , vrThread(nullptr)
     , isVRRotating(false)
     , isExploded(false)
+    , nextVRActorIndex(0)
 {
     ui->setupUi(this);
 
@@ -831,6 +832,7 @@ void MainWindow::populateVRActorsFromTree(const QModelIndex& index)
             part->getSlice()
         );
         actorIndexMap.insert(part, idx);
+        nextVRActorIndex = std::max(nextVRActorIndex, idx + 1);
         /* 注册零件名称,VR内选中时显示在状态栏
          * Register part name for display in status bar when selected in VR */
         vrThread->setActorName(idx, part->data(0).toString());
@@ -1038,6 +1040,7 @@ void MainWindow::on_actionOpen_File_triggered()
                 pkg.decimateOn = newItem->getDecimate();
                 pkg.elevationOn = newItem->getElevation();
                 pkg.sliceOn = newItem->getSlice();
+                actorIndexMap.insert(newItem, nextVRActorIndex++);
                 vrThread->queueAddActor(pkg);
             }
         }
@@ -1169,7 +1172,7 @@ void MainWindow::handleClipToggle(bool checked)
     /* 同步到VR线程中所有已注册的Actor
      * Sync to all registered actors in the VR thread */
     if (vrThread && vrThread->isRunning()) {
-        syncVRFilterRecursive(partList->getRootItem(), FILTER_CLIP, checked);
+        vrThread->issueCommand(CMD_APPLY_FILTER, FILTER_CLIP * 10.0 + (checked ? 1.0 : 0.0), -1);
     }
     emit statusUpdateMessage(
         checked ? "Clip applied to all parts" : "Clip removed from all parts", 2000);
@@ -1182,7 +1185,7 @@ void MainWindow::handleShrinkToggle(bool checked)
     renderWindow->Render();
 
     if (vrThread && vrThread->isRunning()) {
-        syncVRFilterRecursive(partList->getRootItem(), FILTER_SHRINK, checked);
+        vrThread->issueCommand(CMD_APPLY_FILTER, FILTER_SHRINK * 10.0 + (checked ? 1.0 : 0.0), -1);
     }
     emit statusUpdateMessage(
         checked ? "Shrink applied to all parts" : "Shrink removed from all parts", 2000);
@@ -1196,7 +1199,7 @@ void MainWindow::handleSmoothToggle(bool checked)
     renderWindow->Render();
 
     if (vrThread && vrThread->isRunning()) {
-        syncVRFilterRecursive(partList->getRootItem(), FILTER_SMOOTH, checked);
+        vrThread->issueCommand(CMD_APPLY_FILTER, FILTER_SMOOTH * 10.0 + (checked ? 1.0 : 0.0), -1);
     }
     emit statusUpdateMessage(
         checked ? "Smooth applied to all parts" : "Smooth removed from all parts", 2000);
@@ -1209,7 +1212,7 @@ void MainWindow::handleDecimateToggle(bool checked)
     renderWindow->Render();
 
     if (vrThread && vrThread->isRunning()) {
-        syncVRFilterRecursive(partList->getRootItem(), FILTER_DECIMATE, checked);
+        vrThread->issueCommand(CMD_APPLY_FILTER, FILTER_DECIMATE * 10.0 + (checked ? 1.0 : 0.0), -1);
     }
     emit statusUpdateMessage(
         checked ? "Decimate applied to all parts" : "Decimate removed from all parts", 2000);
@@ -1222,7 +1225,7 @@ void MainWindow::handleElevationToggle(bool checked)
     renderWindow->Render();
 
     if (vrThread && vrThread->isRunning()) {
-        syncVRFilterRecursive(partList->getRootItem(), FILTER_ELEVATION, checked);
+        vrThread->issueCommand(CMD_APPLY_FILTER, FILTER_ELEVATION * 10.0 + (checked ? 1.0 : 0.0), -1);
     }
     emit statusUpdateMessage(
         checked ? "Elevation applied to all parts" : "Elevation removed from all parts", 2000);
@@ -1320,6 +1323,7 @@ void MainWindow::on_actionOpen_Directory_triggered()
                 pkg.decimateOn = fileNode->getDecimate();
                 pkg.elevationOn = fileNode->getElevation();
                 pkg.sliceOn = fileNode->getSlice();
+                actorIndexMap.insert(fileNode, nextVRActorIndex++);
                 vrThread->queueAddActor(pkg);
             }
         }

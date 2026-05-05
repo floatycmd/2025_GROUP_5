@@ -86,6 +86,11 @@ VRRenderThread::VRRenderThread(QObject* parent)
      * Initialise saved colour (used to restore when un-highlighting) */
     savedColor[0] = savedColor[1] = savedColor[2] = 1.0;
     vrDragLastPos[0] = vrDragLastPos[1] = vrDragLastPos[2] = 0.0;
+    vrLastControllerPos[0] = vrLastControllerPos[1] = vrLastControllerPos[2] = 0.0;
+    vrLastControllerDir[0] = 0.0;
+    vrLastControllerDir[1] = 0.0;
+    vrLastControllerDir[2] = -1.0;
+    hasVRControllerPose = false;
 }
 
 VRRenderThread::~VRRenderThread()
@@ -359,6 +364,68 @@ int VRRenderThread::pickActorAt(int x, int y, vtkRenderer* renderer)
     return -1;
 }
 
+static bool intersectRayWithBounds(const double origin[3],
+                                   const double direction[3],
+                                   const double bounds[6],
+                                   double& hitDistance)
+{
+    double tMin = 0.0;
+    double tMax = 10000.0;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        double minBound = bounds[axis * 2];
+        double maxBound = bounds[axis * 2 + 1];
+        double o = origin[axis];
+        double d = direction[axis];
+
+        if (std::abs(d) < 1e-9) {
+            if (o < minBound || o > maxBound) return false;
+            continue;
+        }
+
+        double t1 = (minBound - o) / d;
+        double t2 = (maxBound - o) / d;
+        if (t1 > t2) std::swap(t1, t2);
+
+        tMin = std::max(tMin, t1);
+        tMax = std::min(tMax, t2);
+        if (tMin > tMax) return false;
+    }
+
+    hitDistance = tMin;
+    return true;
+}
+
+static int pickActorAlongRay(const QList<vtkActor*>& actors,
+                             const double origin[3],
+                             const double direction[3])
+{
+    int bestIdx = -1;
+    double bestDistance = 1e30;
+
+    for (int i = 0; i < actors.size(); ++i) {
+        vtkActor* actor = actors[i];
+        if (!actor || !actor->GetVisibility()) continue;
+
+        double b[6];
+        actor->GetBounds(b);
+        double maxExtent = std::max({ b[1] - b[0], b[3] - b[2], b[5] - b[4] });
+        double padding = std::max(maxExtent * 0.03, 1e-3);
+        b[0] -= padding; b[1] += padding;
+        b[2] -= padding; b[3] += padding;
+        b[4] -= padding; b[5] += padding;
+
+        double hitDistance = 0.0;
+        if (intersectRayWithBounds(origin, direction, b, hitDistance) &&
+            hitDistance < bestDistance) {
+            bestDistance = hitDistance;
+            bestIdx = i;
+        }
+    }
+
+    return bestIdx;
+}
+
 /* ================================================================
  * 注册零件名称(用于VR内选中时在状态栏显示)
  * Register part name (for display in status bar when selected in VR)
@@ -597,6 +664,25 @@ void VRRenderThread::runVRMode()
     interactor->SetActionManifestDirectory(bindingsDir.toStdString());
     interactor->SetActionManifestFileName(manifestPath.toStdString());
 
+    auto triggerSelect = [this, rendererPtr = renderer.Get()](vtkEventData* eventData) {
+        vtkEventDataDevice3D* event3D =
+            eventData ? eventData->GetAsEventDataDevice3D() : nullptr;
+        if (!event3D) return;
+
+        vtkEventDataAction action = event3D->GetAction();
+        if (action == vtkEventDataAction::Release ||
+            action == vtkEventDataAction::Untouch) {
+            this->onVRTriggerRelease();
+        } else {
+            this->onVRTriggerPress(event3D, rendererPtr);
+        }
+    };
+
+    /* 直接把绑定文件中的TriggerAction接到选择逻辑,避免默认VTK交互样式吞掉事件。
+     * Wire TriggerAction directly to selection so the default VTK style cannot consume it. */
+    interactor->AddAction("/actions/vtk/in/TriggerAction", false, triggerSelect);
+    interactor->AddAction("/actions/vtk/in/triggeraction", false, triggerSelect);
+
     /* 初始化顺序:先renderWindow建立OpenVR会话,再interactor注册动作集
      * Init order: renderWindow first (establishes OpenVR session), interactor second (registers action set) */
     renderWindow->Initialize();
@@ -692,11 +778,11 @@ void VRRenderThread::runVRMode()
         Input  inp = ed->GetInput();
         Action act = ed->GetAction();
 
-        if (inp == Input::Trigger && act == Action::Press)
-            self->onVRTriggerPress(ed, self->vrPickRenderer);
-        else if (inp == Input::Trigger && act == Action::Release)
-            self->onVRTriggerRelease();
-        else if (inp == Input::Grip && act == Action::Press) {
+        bool isRelease = (act == Action::Release || act == Action::Untouch);
+        bool isGrip    = (inp == Input::Grip);
+        bool isMenu    = (inp == Input::ApplicationMenu);
+
+        if (isGrip && !isRelease) {
             /* Grip按下:停止拖动并取消选中
              * Grip press: stop drag and deselect */
             self->onVRTriggerRelease();
@@ -705,9 +791,16 @@ void VRRenderThread::runVRMode()
                 self->selectedActorIndex = -1;
                 emit self->vrActorSelected(-1, "");
             }
+        } else if (isRelease) {
+            self->onVRTriggerRelease();
+        } else if (!isMenu) {
+            self->onVRTriggerPress(ed, self->vrPickRenderer);
         }
     });
     interactor->AddObserver(vtkCommand::Button3DEvent, btnCb);
+    interactor->AddObserver(vtkCommand::Pick3DEvent, btnCb);
+    interactor->AddObserver(vtkCommand::Select3DEvent, btnCb);
+    interactor->AddObserver(vtkCommand::PositionProp3DEvent, btnCb);
 
     /* Move3DEvent观察者:每帧平移被拖动的Actor
      * Move3DEvent observer: translate dragged actor each frame */
@@ -1158,11 +1251,43 @@ void VRRenderThread::onVRTriggerPress(vtkEventDataDevice3D* ed,
     const double* pos = ed->GetWorldPosition();
     const double* dir = ed->GetWorldDirection();
 
+    double p0[3] = { pos[0], pos[1], pos[2] };
+    double rayDir[3] = { dir[0], dir[1], dir[2] };
+    double dirLength = std::sqrt(rayDir[0] * rayDir[0] +
+                                 rayDir[1] * rayDir[1] +
+                                 rayDir[2] * rayDir[2]);
+
+    if (dirLength < 1e-6 && hasVRControllerPose) {
+        p0[0] = vrLastControllerPos[0];
+        p0[1] = vrLastControllerPos[1];
+        p0[2] = vrLastControllerPos[2];
+        rayDir[0] = vrLastControllerDir[0];
+        rayDir[1] = vrLastControllerDir[1];
+        rayDir[2] = vrLastControllerDir[2];
+        dirLength = std::sqrt(rayDir[0] * rayDir[0] +
+                              rayDir[1] * rayDir[1] +
+                              rayDir[2] * rayDir[2]);
+    }
+
+    if (dirLength < 1e-6) return;
+    rayDir[0] /= dirLength;
+    rayDir[1] /= dirLength;
+    rayDir[2] /= dirLength;
+
+    vrLastControllerPos[0] = p0[0];
+    vrLastControllerPos[1] = p0[1];
+    vrLastControllerPos[2] = p0[2];
+    vrLastControllerDir[0] = rayDir[0];
+    vrLastControllerDir[1] = rayDir[1];
+    vrLastControllerDir[2] = rayDir[2];
+    hasVRControllerPose = true;
+
     /* 沿射线方向投射10000单位,计算射线终点
      * Project 10000 units along ray direction to compute ray end */
     const double RAY = 10000.0;
-    double rayEnd[3] = { pos[0]+dir[0]*RAY, pos[1]+dir[1]*RAY, pos[2]+dir[2]*RAY };
-    double p0[3]     = { pos[0], pos[1], pos[2] };
+    double rayEnd[3] = { p0[0] + rayDir[0] * RAY,
+                         p0[1] + rayDir[1] * RAY,
+                         p0[2] + rayDir[2] * RAY };
 
     /* 三维射线与模型Actor做相交测试。
      * Pick3DPoint() accepts a start/end world segment; Pick3DRay() expects an orientation quaternion.
@@ -1183,6 +1308,15 @@ void VRRenderThread::onVRTriggerPress(vtkEventDataDevice3D* ed,
         for (int i = 0; i < actorList.size(); ++i)
             if (actorList[i] == hit) { hitIdx = i; break; }
 
+    if (hitIdx < 0) {
+        hitIdx = pickActorAlongRay(actorList, p0, rayDir);
+    }
+
+    if (hitIdx < 0) {
+        double reverseDir[3] = { -rayDir[0], -rayDir[1], -rayDir[2] };
+        hitIdx = pickActorAlongRay(actorList, p0, reverseDir);
+    }
+
     /* 取消前一个选中的高亮(如果选中了不同Actor)
      * Un-highlight previously selected actor (if a different one was hit) */
     if (selectedActorIndex >= 0 && selectedActorIndex != hitIdx)
@@ -1195,9 +1329,9 @@ void VRRenderThread::onVRTriggerPress(vtkEventDataDevice3D* ed,
         highlightActor(hitIdx, true);
         isDragging         = true;
         dragActorIndex     = hitIdx;
-        vrDragLastPos[0]   = pos[0];
-        vrDragLastPos[1]   = pos[1];
-        vrDragLastPos[2]   = pos[2];
+        vrDragLastPos[0]   = p0[0];
+        vrDragLastPos[1]   = p0[1];
+        vrDragLastPos[2]   = p0[2];
 
         QString name = (hitIdx < actorNames.size())
                        ? actorNames[hitIdx]
@@ -1223,6 +1357,23 @@ void VRRenderThread::onVRTriggerRelease()
 
 void VRRenderThread::onVRControllerMove(vtkEventDataDevice3D* ed)
 {
+    if (ed) {
+        const double* pos = ed->GetWorldPosition();
+        const double* dir = ed->GetWorldDirection();
+        double len = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+
+        vrLastControllerPos[0] = pos[0];
+        vrLastControllerPos[1] = pos[1];
+        vrLastControllerPos[2] = pos[2];
+
+        if (len > 1e-6) {
+            vrLastControllerDir[0] = dir[0] / len;
+            vrLastControllerDir[1] = dir[1] / len;
+            vrLastControllerDir[2] = dir[2] / len;
+        }
+        hasVRControllerPose = true;
+    }
+
     if (!isDragging || dragActorIndex < 0 || !ed) return;
     if (dragActorIndex >= actorList.size() || !actorList[dragActorIndex]) return;
 
@@ -1299,17 +1450,23 @@ void VRRenderThread::processCommandVR(const VRCmd& vcmd, vtkOpenVRRenderer* rend
         bool enabled   = (encoded % 10) != 0;
         int idx        = vcmd.actorIndex;
 
-        if (idx < 0 || idx >= actorList.size()) break;
+        auto applyFilterToIndex = [&](int targetIdx) {
+            if (targetIdx < 0 || targetIdx >= actorList.size() || !actorList[targetIdx]) return;
+            if (filterType == FILTER_CLIP)      clipState[targetIdx]      = enabled;
+            if (filterType == FILTER_SHRINK)    shrinkState[targetIdx]    = enabled;
+            if (filterType == FILTER_SMOOTH)    smoothState[targetIdx]    = enabled;
+            if (filterType == FILTER_DECIMATE)  decimateState[targetIdx]  = enabled;
+            if (filterType == FILTER_ELEVATION) elevationState[targetIdx] = enabled;
+            if (filterType == FILTER_SLICE)     sliceState[targetIdx]     = enabled;
+            rebuildPipeline(targetIdx);
+        };
 
-        /* 更新对应滤镜状态标志
-         * Update the corresponding filter state flag */
-        if (filterType == FILTER_CLIP)      clipState[idx]      = enabled;
-        if (filterType == FILTER_SHRINK)    shrinkState[idx]    = enabled;
-        if (filterType == FILTER_SMOOTH)    smoothState[idx]    = enabled;
-        if (filterType == FILTER_DECIMATE)  decimateState[idx]  = enabled;
-        if (filterType == FILTER_ELEVATION) elevationState[idx] = enabled;
-        if (filterType == FILTER_SLICE)     sliceState[idx]     = enabled;
-        rebuildPipeline(idx);
+        if (idx < 0) {
+            for (int i = 0; i < actorList.size(); ++i) applyFilterToIndex(i);
+        } else {
+            applyFilterToIndex(idx);
+        }
+        if (renderer) renderer->ResetCameraClippingRange();
         break;
     }
 
@@ -1417,15 +1574,23 @@ void VRRenderThread::processCommandDesktop(const VRCmd& vcmd, vtkRenderer* rende
         bool enabled   = (encoded % 10) != 0;
         int idx        = vcmd.actorIndex;
 
-        if (idx < 0 || idx >= actorList.size()) break;
+        auto applyFilterToIndex = [&](int targetIdx) {
+            if (targetIdx < 0 || targetIdx >= actorList.size() || !actorList[targetIdx]) return;
+            if (filterType == FILTER_CLIP)      clipState[targetIdx]      = enabled;
+            if (filterType == FILTER_SHRINK)    shrinkState[targetIdx]    = enabled;
+            if (filterType == FILTER_SMOOTH)    smoothState[targetIdx]    = enabled;
+            if (filterType == FILTER_DECIMATE)  decimateState[targetIdx]  = enabled;
+            if (filterType == FILTER_ELEVATION) elevationState[targetIdx] = enabled;
+            if (filterType == FILTER_SLICE)     sliceState[targetIdx]     = enabled;
+            rebuildPipeline(targetIdx);
+        };
 
-        if (filterType == FILTER_CLIP)      clipState[idx]      = enabled;
-        if (filterType == FILTER_SHRINK)    shrinkState[idx]    = enabled;
-        if (filterType == FILTER_SMOOTH)    smoothState[idx]    = enabled;
-        if (filterType == FILTER_DECIMATE)  decimateState[idx]  = enabled;
-        if (filterType == FILTER_ELEVATION) elevationState[idx] = enabled;
-        if (filterType == FILTER_SLICE)     sliceState[idx]     = enabled;
-        rebuildPipeline(idx);
+        if (idx < 0) {
+            for (int i = 0; i < actorList.size(); ++i) applyFilterToIndex(i);
+        } else {
+            applyFilterToIndex(idx);
+        }
+        if (renderer) renderer->ResetCameraClippingRange();
         break;
     }
 

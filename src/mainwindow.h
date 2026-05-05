@@ -263,6 +263,9 @@ private:
     bool             isExploded;    /**< 爆炸视图是否启用
                                      * Whether exploded view is enabled */
 
+    int nextVRActorIndex; /**< 下一个动态VR Actor索引。
+                           * Next dynamic VR actor index. */
+
     QMap<ModelPart*, int> actorIndexMap; /**< ModelPart指针到VR Actor索引的映射
                                           * Maps ModelPart* to VR actor index */
 
